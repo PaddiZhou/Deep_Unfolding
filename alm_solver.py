@@ -148,9 +148,28 @@ class RISSurfaceNetPowerProblem:
         ps = cfg.ax * cfg.dy * (cfg.ci + cfg.alpha_r * term_norm + 0.5 * cfg.alpha_ir * term_sum)
         return ps
 
+    def power_flux_objective(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Eq. (37a)-style objective used in your screenshots:
+            max_gamma  ak * dy^2 * chi_ir * gamma^H u_ir^* u_ir^T gamma
+        where theta_ir = theta_r and therefore u_ir is evaluated at reflection angle.
+
+        For gradient descent-style updates, we minimize the negative objective value.
+        """
+        cfg = self.cfg
+        gamma = realvec_to_complex_gamma(x, cfg.N)
+        theta_r = torch.tensor([math.radians(cfg.theta_r_deg)], device=self.device, dtype=self.dtype)
+        u_ir = self.build_uik(theta_r)[0]  # [N]
+
+        # gamma^H u* u^T gamma = |u^T gamma|^2
+        gammaTu = torch.sum(u_ir * gamma)
+        chi_ir = (2.0 * math.cos(math.radians(cfg.theta_r_deg))) ** 2
+        return self.ak() * (cfg.dy**2) * chi_ir * complex_abs_sq(gammaTu)
+
     def objective(self, x: torch.Tensor) -> torch.Tensor:
-        gamma = realvec_to_complex_gamma(x, self.cfg.N)
-        return torch.abs(self.Ps(gamma))
+        # ALM inner step minimizes this value.
+        # To maximize power flux, minimize its negative.
+        return -self.power_flux_objective(x)
 
     def ak(self) -> float:
         cfg = self.cfg
@@ -305,11 +324,12 @@ class CorrectedALMSolver:
             # 5) feasibility / stationarity check
             if v <= eps:
                 if gnorm <= eta:
+                    lam_new = lam + sigma * r_new
                     return {
                         "x_star": x_new.detach(),
                         "gamma_star": realvec_to_complex_gamma(x_new.detach(), cfg.N),
                         "slack_star": s_new.detach(),
-                        "lambda_star": lam.detach(),
+                        "lambda_star": lam_new.detach(),
                         "iterations": t + 1,
                         "history": history,
                     }
@@ -527,6 +547,67 @@ def save_abs_gamma_figure(
     return out_path
 
 
+def save_angle_gamma_figure(
+    problem: RISSurfaceNetPowerProblem,
+    gamma_aug: torch.Tensor,
+    out_dir: Path,
+    gamma_cvx: Optional[torch.Tensor] = None,
+    gamma_deep: Optional[torch.Tensor] = None,
+) -> Path:
+    """Save ANGLE(gamma) figure matching paper-style comparison plot."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to save image outputs.") from exc
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    x_axis = problem.y_n.detach().cpu().numpy()
+    aug_ang = torch.angle(gamma_aug.detach().cpu()).numpy()
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    if gamma_cvx is not None:
+        cvx_ang = torch.angle(gamma_cvx.detach().cpu()).numpy()
+        ax.plot(x_axis[: len(cvx_ang)], cvx_ang, "k-*", linewidth=1.0, markersize=6, label="CVX")
+
+    ax.plot(
+        x_axis[: len(aug_ang)],
+        aug_ang,
+        color="red",
+        marker="s",
+        markerfacecolor="none",
+        linewidth=1.0,
+        markersize=6,
+        label="Augment method",
+    )
+
+    if gamma_deep is not None:
+        deep_ang = torch.angle(gamma_deep.detach().cpu()).numpy()
+        ax.plot(
+            x_axis[: len(deep_ang)],
+            deep_ang,
+            color="blue",
+            marker=">",
+            markerfacecolor="none",
+            linewidth=1.0,
+            markersize=6,
+            label="Deep unfolding model",
+        )
+
+    ax.set_title("ANGLE(gamma)")
+    ax.set_xlabel("RIS element position y")
+    ax.set_ylabel("angle(gamma) [rad]")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower left")
+    fig.tight_layout()
+
+    out_path = out_dir / "angle_gamma.png"
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Corrected ALM solver for RIS surface net-power optimization.")
     parser.add_argument("--max-iters", type=int, default=2000, help="Maximum ALM outer iterations.")
@@ -616,5 +697,14 @@ if __name__ == "__main__":
             gamma_cvx=gamma_cvx,
             gamma_deep=gamma_deep,
         )
+        angle_gamma_path = save_angle_gamma_figure(
+            problem=problem,
+            gamma_aug=result["gamma_star"],
+            out_dir=args.figure_dir,
+            gamma_cvx=gamma_cvx,
+            gamma_deep=gamma_deep,
+        )
         print("saved abs(gamma) figure:")
         print(" -", abs_gamma_path)
+        print("saved angle(gamma) figure:")
+        print(" -", angle_gamma_path)
