@@ -615,7 +615,7 @@ if __name__ == "__main__":
         )
         print("saved figures:")
         for path in figure_paths:
-            print(" -", path)
+            print(" -", path.resolve())
 
     if args.save_abs_gamma:
         gamma_cvx = _load_complex_vector(args.cvx_gamma_file) if args.cvx_gamma_file else None
@@ -628,4 +628,4 @@ if __name__ == "__main__":
             gamma_deep=gamma_deep,
         )
         print("saved abs(gamma) figure:")
-        print(" -", abs_gamma_path)
+        print(" -", abs_gamma_path.resolve())
