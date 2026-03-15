@@ -44,6 +44,13 @@ class ALMConfig:
     tighten_factor: float = 0.8
     max_outer_iters: int = 2000
 
+    # Numerical stability controls
+    sigma_max: float = 1e8
+    grad_clip_norm: float = 1e6
+    step_clip_norm: float = 1.0
+    lambda_clip_value: float = 1e10
+    residual_stall_ratio: float = 0.98
+
     # device / dtype
     device: str = "cpu"
     dtype: torch.dtype = torch.float64
@@ -258,6 +265,10 @@ class CorrectedALMSolver:
         grad = torch.autograd.grad(L, x_var)[0]
         return grad.detach(), L.detach()
 
+    @staticmethod
+    def _all_finite(*items: torch.Tensor) -> bool:
+        return all(torch.isfinite(t).all().item() for t in items)
+
     def solve(self, x0: torch.Tensor, use_report_upper: bool = True) -> Dict:
         cfg = self.cfg
         x = x0.detach().clone().to(cfg.device, cfg.dtype)
@@ -270,6 +281,7 @@ class CorrectedALMSolver:
         sigma = cfg.sigma0
         eps = cfg.eps_stop
         eta = cfg.eta_stop
+        prev_v = float("inf")
 
         history: Dict[str, List[float]] = {
             "obj": [],
@@ -279,30 +291,39 @@ class CorrectedALMSolver:
         }
 
         for t in range(cfg.max_outer_iters):
-            # 1) primal update with old variables
             grad, _ = self.grad_x(x, s, lam, sigma, use_report_upper=use_report_upper)
-            w = cfg.beta * w - cfg.mu_gamma * grad
-            x_new = x + w
+            grad_norm = torch.norm(grad, p=2)
+            if torch.isfinite(grad_norm) and grad_norm > cfg.grad_clip_norm:
+                grad = grad * (cfg.grad_clip_norm / (grad_norm + 1e-12))
 
-            # 2) slack update
+            w_candidate = cfg.beta * w - cfg.mu_gamma * grad
+            step_norm = torch.norm(w_candidate, p=2)
+            if torch.isfinite(step_norm) and step_norm > cfg.step_clip_norm:
+                w_candidate = w_candidate * (cfg.step_clip_norm / (step_norm + 1e-12))
+            x_new = x + w_candidate
+
             g_new = self.problem.stacked_constraints(x_new, use_report_upper=use_report_upper)
             s_new = torch.clamp(-g_new - lam / sigma, min=0.0)
-
-            # 3) residual
             r_new = g_new + s_new
 
-            # 4) stopping quantities
-            v = torch.norm(r_new, p=1)
             grad_new, _ = self.grad_x(x_new, s_new, lam, sigma, use_report_upper=use_report_upper)
-            gnorm = torch.norm(grad_new, p=2)
             obj = self.problem.objective(x_new)
+            v = torch.norm(r_new, p=1)
+            gnorm = torch.norm(grad_new, p=2)
+
+            if not self._all_finite(x_new, g_new, s_new, r_new, grad_new, obj, v, gnorm):
+                w = torch.zeros_like(w)
+                sigma = min(max(cfg.sigma0, sigma / max(cfg.tau_sigma, 1.01)), cfg.sigma_max)
+                lam = torch.clamp(lam, -cfg.lambda_clip_value, cfg.lambda_clip_value)
+                if (t + 1) % 100 == 0:
+                    print(f"iter={t + 1:4d}, non-finite detected, apply stabilization, sigma={sigma:.4e}")
+                continue
 
             history["obj"].append(obj.item())
             history["v"].append(v.item())
             history["gnorm"].append(gnorm.item())
             history["sigma"].append(float(sigma))
 
-            # 5) feasibility / stationarity check
             if v <= eps:
                 if gnorm <= eta:
                     return {
@@ -317,16 +338,19 @@ class CorrectedALMSolver:
                 eps *= cfg.tighten_factor
                 eta *= cfg.tighten_factor
             else:
-                sigma_next = cfg.tau_sigma * sigma
+                # only increase sigma when feasibility stops improving
+                stalled = v.item() >= cfg.residual_stall_ratio * prev_v
+                sigma_next = min(cfg.tau_sigma * sigma, cfg.sigma_max) if stalled else sigma
 
-            # 6) corrected multiplier update
-            # equality-form ALM must use residual g+s
             lam_new = lam + sigma * r_new
+            lam_new = torch.clamp(lam_new, -cfg.lambda_clip_value, cfg.lambda_clip_value)
 
             x = x_new.detach()
             s = s_new.detach()
+            w = w_candidate.detach()
             lam = lam_new.detach()
             sigma = sigma_next
+            prev_v = v.item()
 
             if (t + 1) % 100 == 0:
                 print(
