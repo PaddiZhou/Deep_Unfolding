@@ -1,5 +1,7 @@
+import argparse
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List
 
 import torch
@@ -135,8 +137,6 @@ class RISSurfaceNetPowerProblem:
         n = torch.arange(cfg.N, device=self.device, dtype=self.dtype)
         self.y_n = -cfg.Ly + (n + 0.5) * cfg.dy
 
-        self.ones_c = torch.ones(cfg.N, device=self.device, dtype=self.dtype)
-
     def Ps(self, gamma: torch.Tensor) -> torch.Tensor:
         """
         P_s(gamma) = ax * dy * (ci + alpha_r * gamma^H gamma
@@ -172,7 +172,7 @@ class RISSurfaceNetPowerProblem:
         cfg = self.cfg
         gamma = realvec_to_complex_gamma(x, cfg.N)
 
-        uik = self.build_uik(theta_rad)                    # [K, N]
+        uik = self.build_uik(theta_rad)  # [K, N]
         gammaTu = torch.sum(uik * gamma.unsqueeze(0), dim=1)  # gamma^T u
         chi_ik = (
             math.cos(math.radians(cfg.theta_r_deg))**2
@@ -313,10 +313,9 @@ class CorrectedALMSolver:
                         "iterations": t + 1,
                         "history": history,
                     }
-                else:
-                    sigma_next = sigma
-                    eps *= cfg.tighten_factor
-                    eta *= cfg.tighten_factor
+                sigma_next = sigma
+                eps *= cfg.tighten_factor
+                eta *= cfg.tighten_factor
             else:
                 sigma_next = cfg.tau_sigma * sigma
 
@@ -331,7 +330,7 @@ class CorrectedALMSolver:
 
             if (t + 1) % 100 == 0:
                 print(
-                    f"iter={t+1:4d}, obj={obj.item():.4e}, "
+                    f"iter={t + 1:4d}, obj={obj.item():.4e}, "
                     f"v={v.item():.4e}, gnorm={gnorm.item():.4e}, sigma={sigma:.4e}"
                 )
 
@@ -346,7 +345,7 @@ class CorrectedALMSolver:
 
 
 # ============================================================
-# 5) Initialization
+# 5) Initialization / visualization helpers
 # ============================================================
 
 def init_gamma_as_real_vector(cfg: ALMConfig, init_val: float = 1e-3) -> torch.Tensor:
@@ -355,11 +354,103 @@ def init_gamma_as_real_vector(cfg: ALMConfig, init_val: float = 1e-3) -> torch.T
     return torch.cat([re, im], dim=0)
 
 
+def save_result_figures(
+    problem: RISSurfaceNetPowerProblem,
+    result: Dict,
+    out_dir: Path,
+    use_report_upper: bool,
+) -> List[Path]:
+    """Save optimization history and reradiation pattern figures."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to save image outputs.") from exc
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved: List[Path] = []
+
+    history = result["history"]
+    iters = list(range(1, len(history["obj"]) + 1))
+
+    fig1, axs = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+    axs[0].plot(iters, history["obj"], linewidth=1.5)
+    axs[0].set_ylabel("|Ps(gamma)|")
+    axs[0].set_yscale("log")
+    axs[0].grid(True, alpha=0.3)
+
+    axs[1].plot(iters, history["v"], linewidth=1.5)
+    axs[1].set_ylabel("||g+s||_1")
+    axs[1].set_yscale("log")
+    axs[1].grid(True, alpha=0.3)
+
+    axs[2].plot(iters, history["gnorm"], linewidth=1.5)
+    axs[2].set_ylabel("||grad L||_2")
+    axs[2].set_xlabel("outer iteration")
+    axs[2].set_yscale("log")
+    axs[2].grid(True, alpha=0.3)
+    fig1.suptitle("ALM convergence diagnostics")
+    fig1.tight_layout()
+
+    history_path = out_dir / "alm_history.png"
+    fig1.savefig(history_path, dpi=150)
+    plt.close(fig1)
+    saved.append(history_path)
+
+    theta_deg = torch.linspace(-90.0, 90.0, 1801, dtype=problem.dtype, device=problem.device)
+    theta_rad = torch.deg2rad(theta_deg)
+    p_theta = problem.reradiation_power(result["x_star"], theta_rad).detach().cpu()
+    theta_mask = problem.cfg.theta_mask_deg.detach().cpu()
+    p_mask = problem.reradiation_power(
+        result["x_star"],
+        problem.cfg.theta_mask_rad.to(device=problem.device, dtype=problem.dtype),
+    ).detach().cpu()
+
+    fig2, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(theta_deg.cpu().numpy(), p_theta.numpy(), label="reradiation power", linewidth=1.3)
+    ax.scatter(theta_mask.numpy(), p_mask.numpy(), s=10, c="red", label="mask samples", alpha=0.8)
+    ax.axhline(problem.cfg.eps_RM, color="black", linestyle="--", linewidth=1.0, label="eps_RM")
+    upper_mode = "report" if use_report_upper else "direct"
+    ax.set_title(f"Reradiation pattern (upper constraint: {upper_mode})")
+    ax.set_xlabel("theta (deg)")
+    ax.set_ylabel("P_theta")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right")
+    fig2.tight_layout()
+
+    pattern_path = out_dir / "reradiation_pattern.png"
+    fig2.savefig(pattern_path, dpi=150)
+    plt.close(fig2)
+    saved.append(pattern_path)
+
+    return saved
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Corrected ALM solver for RIS surface net-power optimization.")
+    parser.add_argument("--max-iters", type=int, default=2000, help="Maximum ALM outer iterations.")
+    parser.add_argument("--save-figures", action="store_true", help="Save output figures after optimization.")
+    parser.add_argument(
+        "--figure-dir",
+        type=Path,
+        default=Path("outputs"),
+        help="Directory where PNG figures are saved when --save-figures is enabled.",
+    )
+    parser.add_argument(
+        "--use-direct-upper",
+        action="store_true",
+        help="Use direct upper impedance constraint instead of report quadratic form.",
+    )
+    return parser.parse_args()
+
+
 # ============================================================
 # 6) Example run
 # ============================================================
 
 if __name__ == "__main__":
+    args = parse_args()
+
     cfg = ALMConfig(
         mu_gamma=2e-12,
         beta=0.9,
@@ -367,7 +458,7 @@ if __name__ == "__main__":
         tau_sigma=1.1,
         eps_stop=1e-6,
         eta_stop=1e-6,
-        max_outer_iters=2000,
+        max_outer_iters=args.max_iters,
         device="cpu",
         dtype=torch.float64,
     )
@@ -376,12 +467,23 @@ if __name__ == "__main__":
     solver = CorrectedALMSolver(problem, cfg)
 
     x0 = init_gamma_as_real_vector(cfg, init_val=1e-3)
+    use_report_upper = not args.use_direct_upper
 
-    # use_report_upper=True means use Shumin's quadratic upper-bound form (10d)
-    result = solver.solve(x0, use_report_upper=True)
+    result = solver.solve(x0, use_report_upper=use_report_upper)
 
     gamma_star = result["gamma_star"]
     print("\nFinished.")
     print("iterations:", result["iterations"])
     print("final ||gamma||2:", torch.norm(torch.abs(gamma_star), p=2).item())
     print("final objective |Ps(gamma)|:", problem.objective(result["x_star"]).item())
+
+    if args.save_figures:
+        figure_paths = save_result_figures(
+            problem=problem,
+            result=result,
+            out_dir=args.figure_dir,
+            use_report_upper=use_report_upper,
+        )
+        print("saved figures:")
+        for path in figure_paths:
+            print(" -", path)
