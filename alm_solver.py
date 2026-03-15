@@ -530,6 +530,12 @@ def save_abs_gamma_figure(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Corrected ALM solver for RIS surface net-power optimization.")
     parser.add_argument("--max-iters", type=int, default=2000, help="Maximum ALM outer iterations.")
+    parser.add_argument("--mu-gamma", type=float, default=2e-12, help="Momentum gradient scale in ALM primal update.")
+    parser.add_argument("--beta", type=float, default=0.9, help="Momentum coefficient in ALM primal update.")
+    parser.add_argument("--sigma0", type=float, default=100.0, help="Initial ALM penalty parameter.")
+    parser.add_argument("--tau-sigma", type=float, default=1.1, help="Penalty growth factor when infeasible.")
+    parser.add_argument("--eps-stop", type=float, default=1e-6, help="Constraint residual stopping threshold.")
+    parser.add_argument("--eta-stop", type=float, default=1e-6, help="Stationarity stopping threshold.")
     parser.add_argument("--save-figures", action="store_true", help="Save output figures after optimization.")
     parser.add_argument(
         "--figure-dir",
@@ -562,24 +568,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def build_config(args: argparse.Namespace) -> ALMConfig:
+    return ALMConfig(
+        mu_gamma=args.mu_gamma,
+        beta=args.beta,
+        sigma0=args.sigma0,
+        tau_sigma=args.tau_sigma,
+        eps_stop=args.eps_stop,
+        eta_stop=args.eta_stop,
+        max_outer_iters=args.max_iters,
+        device="cpu",
+        dtype=torch.float64,
+    )
+
+
 # ============================================================
 # 6) Example run
 # ============================================================
 
 if __name__ == "__main__":
     args = parse_args()
-
-    cfg = ALMConfig(
-        mu_gamma=2e-12,
-        beta=0.9,
-        sigma0=100.0,
-        tau_sigma=1.1,
-        eps_stop=1e-6,
-        eta_stop=1e-6,
-        max_outer_iters=args.max_iters,
-        device="cpu",
-        dtype=torch.float64,
-    )
+    cfg = build_config(args)
 
     problem = RISSurfaceNetPowerProblem(cfg)
     solver = CorrectedALMSolver(problem, cfg)
