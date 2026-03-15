@@ -2,7 +2,7 @@ import argparse
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -426,6 +426,107 @@ def save_result_figures(
     return saved
 
 
+def _load_complex_vector(path: Path) -> torch.Tensor:
+    """Load a complex vector from .pt/.pth/.npy/.npz/.txt/.csv file."""
+    suffix = path.suffix.lower()
+
+    if suffix in {".pt", ".pth"}:
+        data = torch.load(path, map_location="cpu")
+        if isinstance(data, dict):
+            for key in ("gamma", "gamma_star", "x"):
+                if key in data:
+                    data = data[key]
+                    break
+        tensor = torch.as_tensor(data)
+        if tensor.is_complex():
+            return tensor.flatten()
+        if tensor.numel() % 2 == 0 and tensor.ndim == 1:
+            n = tensor.numel() // 2
+            return torch.complex(tensor[:n], tensor[n:])
+        return torch.complex(tensor.flatten(), torch.zeros_like(tensor.flatten()))
+
+    import numpy as np
+
+    if suffix == ".npy":
+        arr = np.load(path)
+    elif suffix == ".npz":
+        data = np.load(path)
+        arr = data[data.files[0]]
+    else:
+        arr = np.loadtxt(path, delimiter="," if suffix == ".csv" else None)
+
+    arr = np.asarray(arr)
+    if np.iscomplexobj(arr):
+        return torch.from_numpy(arr.astype(np.complex128)).flatten()
+    if arr.ndim == 2 and arr.shape[1] == 2:
+        return torch.from_numpy((arr[:, 0] + 1j * arr[:, 1]).astype(np.complex128)).flatten()
+    if arr.ndim == 1 and arr.size % 2 == 0:
+        n = arr.size // 2
+        return torch.from_numpy((arr[:n] + 1j * arr[n:]).astype(np.complex128)).flatten()
+    return torch.from_numpy(arr.astype(np.float64)).to(torch.complex128).flatten()
+
+
+def save_abs_gamma_figure(
+    problem: RISSurfaceNetPowerProblem,
+    gamma_aug: torch.Tensor,
+    out_dir: Path,
+    gamma_cvx: Optional[torch.Tensor] = None,
+    gamma_deep: Optional[torch.Tensor] = None,
+) -> Path:
+    """Save ABS(gamma) figure matching paper-style comparison plot."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to save image outputs.") from exc
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    x_axis = problem.y_n.detach().cpu().numpy()
+    aug_abs = torch.abs(gamma_aug.detach().cpu()).numpy()
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    if gamma_cvx is not None:
+        cvx_abs = torch.abs(gamma_cvx.detach().cpu()).numpy()
+        ax.plot(x_axis[: len(cvx_abs)], cvx_abs, "k-*", linewidth=1.0, markersize=6, label="CVX")
+
+    ax.plot(
+        x_axis[: len(aug_abs)],
+        aug_abs,
+        color="red",
+        marker="s",
+        markerfacecolor="none",
+        linewidth=1.0,
+        markersize=6,
+        label="Augment method",
+    )
+
+    if gamma_deep is not None:
+        deep_abs = torch.abs(gamma_deep.detach().cpu()).numpy()
+        ax.plot(
+            x_axis[: len(deep_abs)],
+            deep_abs,
+            color="blue",
+            marker=">",
+            markerfacecolor="none",
+            linewidth=1.0,
+            markersize=6,
+            label="Deep unfolding model",
+        )
+
+    ax.set_title("ABS(gamma)")
+    ax.set_xlabel("RIS element position y")
+    ax.set_ylabel("|gamma|")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+
+    out_path = out_dir / "abs_gamma.png"
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Corrected ALM solver for RIS surface net-power optimization.")
     parser.add_argument("--max-iters", type=int, default=2000, help="Maximum ALM outer iterations.")
@@ -440,6 +541,23 @@ def parse_args() -> argparse.Namespace:
         "--use-direct-upper",
         action="store_true",
         help="Use direct upper impedance constraint instead of report quadratic form.",
+    )
+    parser.add_argument(
+        "--save-abs-gamma",
+        action="store_true",
+        help="Save ABS(gamma) plot for augmented method (and optional comparison curves).",
+    )
+    parser.add_argument(
+        "--cvx-gamma-file",
+        type=Path,
+        default=None,
+        help="Optional path to CVX gamma vector (.pt/.pth/.npy/.npz/.txt/.csv).",
+    )
+    parser.add_argument(
+        "--deep-gamma-file",
+        type=Path,
+        default=None,
+        help="Optional path to deep-unfolding gamma vector (.pt/.pth/.npy/.npz/.txt/.csv).",
     )
     return parser.parse_args()
 
@@ -487,3 +605,16 @@ if __name__ == "__main__":
         print("saved figures:")
         for path in figure_paths:
             print(" -", path)
+
+    if args.save_abs_gamma:
+        gamma_cvx = _load_complex_vector(args.cvx_gamma_file) if args.cvx_gamma_file else None
+        gamma_deep = _load_complex_vector(args.deep_gamma_file) if args.deep_gamma_file else None
+        abs_gamma_path = save_abs_gamma_figure(
+            problem=problem,
+            gamma_aug=result["gamma_star"],
+            out_dir=args.figure_dir,
+            gamma_cvx=gamma_cvx,
+            gamma_deep=gamma_deep,
+        )
+        print("saved abs(gamma) figure:")
+        print(" -", abs_gamma_path)
