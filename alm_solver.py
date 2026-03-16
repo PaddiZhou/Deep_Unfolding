@@ -38,11 +38,18 @@ class ALMConfig:
     sigma0: float = 100.0
 
     # Practical stopping / penalty controls
-    tau_sigma: float = 1.1
+    tau_sigma: float = 1.05
+    sigma_max: float = 1e8
     eps_stop: float = 1e-6
     eta_stop: float = 1e-6
     tighten_factor: float = 0.8
     max_outer_iters: int = 2000
+
+    # Numerical-stability controls (to avoid exploding ALM updates)
+    grad_clip_norm: float = 1e6
+    momentum_clip_norm: float = 1e2
+    x_clip_value: float = 5.0
+    lambda_clip_value: float = 1e8
 
     # device / dtype
     device: str = "cpu"
@@ -281,12 +288,21 @@ class CorrectedALMSolver:
         for t in range(cfg.max_outer_iters):
             # 1) primal update with old variables
             grad, _ = self.grad_x(x, s, lam, sigma, use_report_upper=use_report_upper)
+            grad_norm = torch.norm(grad, p=2)
+            if torch.isfinite(grad_norm) and grad_norm > cfg.grad_clip_norm:
+                grad = grad * (cfg.grad_clip_norm / (grad_norm + 1e-12))
+
             w = cfg.beta * w - cfg.mu_gamma * grad
+            w_norm = torch.norm(w, p=2)
+            if torch.isfinite(w_norm) and w_norm > cfg.momentum_clip_norm:
+                w = w * (cfg.momentum_clip_norm / (w_norm + 1e-12))
+
             x_new = x + w
+            x_new = torch.clamp(x_new, min=-cfg.x_clip_value, max=cfg.x_clip_value)
 
             # 2) slack update
             g_new = self.problem.stacked_constraints(x_new, use_report_upper=use_report_upper)
-            s_new = torch.clamp(-g_new - lam / sigma, min=0.0)
+            s_new = torch.clamp(-g_new - lam / max(sigma, 1e-30), min=0.0)
 
             # 3) residual
             r_new = g_new + s_new
@@ -296,6 +312,11 @@ class CorrectedALMSolver:
             grad_new, _ = self.grad_x(x_new, s_new, lam, sigma, use_report_upper=use_report_upper)
             gnorm = torch.norm(grad_new, p=2)
             obj = self.problem.objective(x_new)
+
+            # NaN / Inf guard: stop early with last finite iterate
+            if not (torch.isfinite(obj) and torch.isfinite(v) and torch.isfinite(gnorm)):
+                print(f"Warning: non-finite value detected at iter={t + 1}, stopping early.")
+                break
 
             history["obj"].append(obj.item())
             history["v"].append(v.item())
@@ -317,11 +338,12 @@ class CorrectedALMSolver:
                 eps *= cfg.tighten_factor
                 eta *= cfg.tighten_factor
             else:
-                sigma_next = cfg.tau_sigma * sigma
+                sigma_next = min(cfg.tau_sigma * sigma, cfg.sigma_max)
 
             # 6) corrected multiplier update
             # equality-form ALM must use residual g+s
             lam_new = lam + sigma * r_new
+            lam_new = torch.clamp(lam_new, min=-cfg.lambda_clip_value, max=cfg.lambda_clip_value)
 
             x = x_new.detach()
             s = s_new.detach()
@@ -533,6 +555,90 @@ def _plot_gamma_curve(ax, x_vals, gamma_vals: torch.Tensor, value_kind: str, lab
         raise ValueError(f"Unknown style: {style}")
 
 
+def draw_gamma_with_turtle(
+    problem: RISSurfaceNetPowerProblem,
+    gamma_aug: torch.Tensor,
+    gamma_cvx: Optional[torch.Tensor] = None,
+    gamma_deep: Optional[torch.Tensor] = None,
+    axis_mode: str = "position",
+) -> None:
+    """
+    使用 python turtle 直接在窗口里绘图（不依赖 matplotlib）。
+    主要用于“本地想马上看图”的场景。
+    """
+    import turtle
+
+    n_ref = problem.cfg.N
+    x_axis = _build_gamma_plot_axis(problem, axis_mode).numpy()
+
+    g_alm = _trim_gamma(gamma_aug, n_ref=n_ref, tag="ALM gamma")
+    g_cvx = _trim_gamma(gamma_cvx, n_ref=n_ref, tag="CVX gamma") if gamma_cvx is not None else None
+    g_deep = _trim_gamma(gamma_deep, n_ref=n_ref, tag="Deep-unfolding gamma") if gamma_deep is not None else None
+
+    curves = [
+        ("ALM abs", torch.abs(g_alm).numpy(), "red"),
+        ("ALM angle", torch.angle(g_alm).numpy(), "orange"),
+    ]
+    if g_cvx is not None:
+        curves += [
+            ("CVX abs", torch.abs(g_cvx).numpy(), "black"),
+            ("CVX angle", torch.angle(g_cvx).numpy(), "gray"),
+        ]
+    if g_deep is not None:
+        curves += [
+            ("Deep abs", torch.abs(g_deep).numpy(), "blue"),
+            ("Deep angle", torch.angle(g_deep).numpy(), "green"),
+        ]
+
+    all_y = [y for _, ys, _ in curves for y in ys]
+    y_min, y_max = float(min(all_y)), float(max(all_y))
+    if abs(y_max - y_min) < 1e-12:
+        y_max = y_min + 1.0
+
+    screen = turtle.Screen()
+    screen.title("Gamma plot by turtle (ABS and ANGLE)")
+    screen.setup(width=1200, height=800)
+    screen.bgcolor("white")
+
+    pen = turtle.Turtle(visible=False)
+    pen.speed(0)
+    pen.pensize(2)
+
+    left, right = -520, 520
+    bottom, top = -320, 320
+
+    def map_x(v):
+        x0, x1 = float(min(x_axis)), float(max(x_axis))
+        if abs(x1 - x0) < 1e-12:
+            return (left + right) / 2
+        return left + (v - x0) / (x1 - x0) * (right - left)
+
+    def map_y(v):
+        return bottom + (v - y_min) / (y_max - y_min) * (top - bottom)
+
+    # axis
+    pen.color("black")
+    pen.penup(); pen.goto(left, 0); pen.pendown(); pen.goto(right, 0)
+    pen.penup(); pen.goto(0, bottom); pen.pendown(); pen.goto(0, top)
+
+    # plot curves
+    for name, ys, color in curves:
+        pen.color(color)
+        pen.penup()
+        pen.goto(map_x(x_axis[0]), map_y(ys[0]))
+        pen.pendown()
+        for xv, yv in zip(x_axis[1:], ys[1:]):
+            pen.goto(map_x(float(xv)), map_y(float(yv)))
+
+    # legend text
+    pen.penup()
+    pen.goto(left, top + 10)
+    pen.color("black")
+    pen.write(" | ".join([f"{name}" for name, _, _ in curves]), font=("Arial", 10, "normal"))
+
+    turtle.done()
+
+
 def save_gamma_comparison_figures(
     problem: RISSurfaceNetPowerProblem,
     gamma_aug: torch.Tensor,
@@ -648,6 +754,16 @@ def parse_args() -> argparse.Namespace:
         default="position",
         help="X-axis for gamma plots: 'position' (paper-style y coordinate) or 'cell' (index 1..N).",
     )
+    parser.add_argument(
+        "--draw-gamma-turtle",
+        action="store_true",
+        help="Draw ABS/ANGLE gamma curves with python turtle for immediate local visualization.",
+    )
+    parser.add_argument(
+        "--plot-only",
+        action="store_true",
+        help="Skip ALM solving and only draw/save plots using provided gamma files.",
+    )
     return parser.parse_args()
 
 
@@ -662,7 +778,7 @@ if __name__ == "__main__":
         mu_gamma=2e-12,
         beta=0.9,
         sigma0=100.0,
-        tau_sigma=1.1,
+        tau_sigma=1.05,
         eps_stop=1e-6,
         eta_stop=1e-6,
         max_outer_iters=args.max_iters,
@@ -673,40 +789,80 @@ if __name__ == "__main__":
     problem = RISSurfaceNetPowerProblem(cfg)
     solver = CorrectedALMSolver(problem, cfg)
 
-    x0 = init_gamma_as_real_vector(cfg, init_val=1e-3)
     use_report_upper = not args.use_direct_upper
 
-    result = solver.solve(x0, use_report_upper=use_report_upper)
+    gamma_cvx = _load_complex_vector(args.cvx_gamma_file) if args.cvx_gamma_file else None
+    gamma_deep = _load_complex_vector(args.deep_gamma_file) if args.deep_gamma_file else None
 
-    gamma_star = result["gamma_star"]
-    print("\nFinished.")
-    print("iterations:", result["iterations"])
-    print("final ||gamma||2:", torch.norm(torch.abs(gamma_star), p=2).item())
-    print("final objective |Ps(gamma)|:", problem.objective(result["x_star"]).item())
+    if args.plot_only:
+        # plot-only 模式下，不再跑 ALM；优先用 deep 曲线当主曲线，否则用 cvx。
+        if gamma_deep is not None:
+            gamma_aug = gamma_deep
+        elif gamma_cvx is not None:
+            gamma_aug = gamma_cvx
+        else:
+            raise ValueError("--plot-only requires at least one of --deep-gamma-file or --cvx-gamma-file.")
 
-    if args.save_figures:
-        figure_paths = save_result_figures(
-            problem=problem,
-            result=result,
-            out_dir=args.figure_dir,
-            use_report_upper=use_report_upper,
-        )
-        print("saved figures:")
-        for path in figure_paths:
-            print(" -", path)
+        if args.save_gamma_figures:
+            gamma_fig_paths = save_gamma_comparison_figures(
+                problem=problem,
+                gamma_aug=gamma_aug,
+                out_dir=args.figure_dir,
+                gamma_cvx=gamma_cvx,
+                gamma_deep=gamma_deep,
+                axis_mode=args.gamma_x_axis,
+            )
+            print("saved gamma comparison figures (plot-only mode):")
+            for path in gamma_fig_paths:
+                print(" -", path)
 
-    if args.save_gamma_figures:
-        gamma_cvx = _load_complex_vector(args.cvx_gamma_file) if args.cvx_gamma_file else None
-        gamma_deep = _load_complex_vector(args.deep_gamma_file) if args.deep_gamma_file else None
-        gamma_fig_paths = save_gamma_comparison_figures(
-            problem=problem,
-            gamma_aug=result["gamma_star"],
-            out_dir=args.figure_dir,
-            gamma_cvx=gamma_cvx,
-            gamma_deep=gamma_deep,
-            axis_mode=args.gamma_x_axis,
-        )
-        print("saved gamma comparison figures:")
-        for path in gamma_fig_paths:
-            print(" -", path)
+        if args.draw_gamma_turtle:
+            draw_gamma_with_turtle(
+                problem=problem,
+                gamma_aug=gamma_aug,
+                gamma_cvx=gamma_cvx,
+                gamma_deep=gamma_deep,
+                axis_mode=args.gamma_x_axis,
+            )
+    else:
+        x0 = init_gamma_as_real_vector(cfg, init_val=1e-3)
+        result = solver.solve(x0, use_report_upper=use_report_upper)
 
+        gamma_star = result["gamma_star"]
+        print("\nFinished.")
+        print("iterations:", result["iterations"])
+        print("final ||gamma||2:", torch.norm(torch.abs(gamma_star), p=2).item())
+        print("final objective |Ps(gamma)|:", problem.objective(result["x_star"]).item())
+
+        if args.save_figures:
+            figure_paths = save_result_figures(
+                problem=problem,
+                result=result,
+                out_dir=args.figure_dir,
+                use_report_upper=use_report_upper,
+            )
+            print("saved figures:")
+            for path in figure_paths:
+                print(" -", path)
+
+        if args.save_gamma_figures:
+            gamma_fig_paths = save_gamma_comparison_figures(
+                problem=problem,
+                gamma_aug=result["gamma_star"],
+                out_dir=args.figure_dir,
+                gamma_cvx=gamma_cvx,
+                gamma_deep=gamma_deep,
+                axis_mode=args.gamma_x_axis,
+            )
+            print("saved gamma comparison figures:")
+            for path in gamma_fig_paths:
+                print(" -", path)
+
+        if args.draw_gamma_turtle:
+            draw_gamma_with_turtle(
+                problem=problem,
+                gamma_aug=result["gamma_star"],
+                gamma_cvx=gamma_cvx,
+                gamma_deep=gamma_deep,
+                axis_mode=args.gamma_x_axis,
+            )
