@@ -466,14 +466,90 @@ def _load_complex_vector(path: Path) -> torch.Tensor:
     return torch.from_numpy(arr.astype(np.float64)).to(torch.complex128).flatten()
 
 
-def save_abs_gamma_figure(
+def _build_gamma_plot_axis(problem: RISSurfaceNetPowerProblem, axis_mode: str) -> torch.Tensor:
+    """
+    根据用户需求，支持两种横轴：
+    1) "position": 与论文 Figure 4/5 一致，横轴为每个 cell 的物理位置 y (m)。
+    2) "cell": 横轴为 cell 编号 1..N。
+    """
+    if axis_mode == "position":
+        return problem.y_n.detach().cpu()
+    if axis_mode == "cell":
+        return torch.arange(1, problem.cfg.N + 1, dtype=problem.dtype).cpu()
+    raise ValueError(f"Unknown axis_mode: {axis_mode}")
+
+
+def _trim_gamma(gamma: torch.Tensor, n_ref: int, tag: str) -> torch.Tensor:
+    """
+    将外部加载的 gamma 对齐到当前仿真的 N。
+    - 长度大于 N: 截断到前 N 个元素；
+    - 长度小于 N: 直接报错，避免 silently 画错图。
+    """
+    g = gamma.flatten().detach().cpu()
+    if g.numel() < n_ref:
+        raise ValueError(f"{tag} length={g.numel()} is smaller than required N={n_ref}.")
+    return g[:n_ref]
+
+
+def _plot_gamma_curve(ax, x_vals, gamma_vals: torch.Tensor, value_kind: str, label: str, style: str) -> None:
+    """
+    统一三种方法(CVX/ALM/Deep Unfolding)的曲线绘制入口，避免重复逻辑。
+    value_kind:
+      - "abs":   绘制 |gamma|
+      - "angle": 绘制 angle(gamma)
+    """
+    if value_kind == "abs":
+        y_vals = torch.abs(gamma_vals).numpy()
+    elif value_kind == "angle":
+        y_vals = torch.angle(gamma_vals).numpy()
+    else:
+        raise ValueError(f"Unknown value_kind: {value_kind}")
+
+    if style == "cvx":
+        ax.plot(x_vals, y_vals, "k-*", linewidth=1.0, markersize=6, label=label)
+    elif style == "alm":
+        ax.plot(
+            x_vals,
+            y_vals,
+            color="red",
+            marker="s",
+            markerfacecolor="none",
+            linewidth=1.0,
+            markersize=6,
+            label=label,
+        )
+    elif style == "deep":
+        ax.plot(
+            x_vals,
+            y_vals,
+            color="blue",
+            marker=">",
+            markerfacecolor="none",
+            linewidth=1.0,
+            markersize=6,
+            label=label,
+        )
+    else:
+        raise ValueError(f"Unknown style: {style}")
+
+
+def save_gamma_comparison_figures(
     problem: RISSurfaceNetPowerProblem,
     gamma_aug: torch.Tensor,
     out_dir: Path,
     gamma_cvx: Optional[torch.Tensor] = None,
     gamma_deep: Optional[torch.Tensor] = None,
-) -> Path:
-    """Save ABS(gamma) figure matching paper-style comparison plot."""
+    axis_mode: str = "position",
+) -> List[Path]:
+    """
+    生成论文 Figure 4/5 风格的两张图：
+      - abs_gamma.png
+      - angle_gamma.png
+
+    说明：
+    - 三条曲线分别对应 CVX / ALM / Deep unfolding；
+    - 横轴可选 cell 编号或物理位置。
+    """
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -481,113 +557,57 @@ def save_abs_gamma_figure(
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    x_axis = problem.y_n.detach().cpu().numpy()
-    aug_abs = torch.abs(gamma_aug.detach().cpu()).numpy()
+    n_ref = problem.cfg.N
+    axis_tensor = _build_gamma_plot_axis(problem, axis_mode)
+    axis_np = axis_tensor.numpy()
 
-    fig, ax = plt.subplots(figsize=(9, 6))
+    # 统一裁剪长度，确保三种方法在同一个 N 上对比。
+    g_alm = _trim_gamma(gamma_aug, n_ref=n_ref, tag="ALM gamma")
+    g_cvx = _trim_gamma(gamma_cvx, n_ref=n_ref, tag="CVX gamma") if gamma_cvx is not None else None
+    g_deep = _trim_gamma(gamma_deep, n_ref=n_ref, tag="Deep-unfolding gamma") if gamma_deep is not None else None
 
-    if gamma_cvx is not None:
-        cvx_abs = torch.abs(gamma_cvx.detach().cpu()).numpy()
-        ax.plot(x_axis[: len(cvx_abs)], cvx_abs, "k-*", linewidth=1.0, markersize=6, label="CVX")
+    xlabel = "RIS element position y" if axis_mode == "position" else "Cell index n"
 
-    ax.plot(
-        x_axis[: len(aug_abs)],
-        aug_abs,
-        color="red",
-        marker="s",
-        markerfacecolor="none",
-        linewidth=1.0,
-        markersize=6,
-        label="Augment method",
-    )
+    # -------------------- Figure 4: ABS(gamma) --------------------
+    fig_abs, ax_abs = plt.subplots(figsize=(9, 6))
+    if g_cvx is not None:
+        _plot_gamma_curve(ax_abs, axis_np, g_cvx, value_kind="abs", label="CVX", style="cvx")
+    _plot_gamma_curve(ax_abs, axis_np, g_alm, value_kind="abs", label="Augment method", style="alm")
+    if g_deep is not None:
+        _plot_gamma_curve(ax_abs, axis_np, g_deep, value_kind="abs", label="Deep unfolding model", style="deep")
 
-    if gamma_deep is not None:
-        deep_abs = torch.abs(gamma_deep.detach().cpu()).numpy()
-        ax.plot(
-            x_axis[: len(deep_abs)],
-            deep_abs,
-            color="blue",
-            marker=">",
-            markerfacecolor="none",
-            linewidth=1.0,
-            markersize=6,
-            label="Deep unfolding model",
-        )
+    ax_abs.set_title("ABS(gamma)")
+    ax_abs.set_xlabel(xlabel)
+    ax_abs.set_ylabel("|gamma|")
+    ax_abs.grid(True, alpha=0.3)
+    ax_abs.legend(loc="upper right")
+    fig_abs.tight_layout()
 
-    ax.set_title("ABS(gamma)")
-    ax.set_xlabel("RIS element position y")
-    ax.set_ylabel("|gamma|")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right")
-    fig.tight_layout()
+    abs_path = out_dir / "abs_gamma.png"
+    fig_abs.savefig(abs_path, dpi=200)
+    plt.close(fig_abs)
 
-    out_path = out_dir / "abs_gamma.png"
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
-    return out_path
+    # -------------------- Figure 5: ANGLE(gamma) --------------------
+    fig_ang, ax_ang = plt.subplots(figsize=(9, 6))
+    if g_cvx is not None:
+        _plot_gamma_curve(ax_ang, axis_np, g_cvx, value_kind="angle", label="CVX", style="cvx")
+    _plot_gamma_curve(ax_ang, axis_np, g_alm, value_kind="angle", label="Augment method", style="alm")
+    if g_deep is not None:
+        _plot_gamma_curve(ax_ang, axis_np, g_deep, value_kind="angle", label="Deep unfolding model", style="deep")
 
+    ax_ang.set_title("ANGLE(gamma)")
+    ax_ang.set_xlabel(xlabel)
+    ax_ang.set_ylabel("angle(gamma) [rad]")
+    ax_ang.set_ylim([-4.0, 4.0])
+    ax_ang.grid(True, alpha=0.3)
+    ax_ang.legend(loc="lower center")
+    fig_ang.tight_layout()
 
-def save_angle_gamma_figure(
-    problem: RISSurfaceNetPowerProblem,
-    gamma_aug: torch.Tensor,
-    out_dir: Path,
-    gamma_cvx: Optional[torch.Tensor] = None,
-    gamma_deep: Optional[torch.Tensor] = None,
-) -> Path:
-    """Save ANGLE(gamma) figure matching paper-style comparison plot."""
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError as exc:
-        raise RuntimeError("matplotlib is required to save image outputs.") from exc
+    angle_path = out_dir / "angle_gamma.png"
+    fig_ang.savefig(angle_path, dpi=200)
+    plt.close(fig_ang)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    x_axis = problem.y_n.detach().cpu().numpy()
-    aug_angle = torch.angle(gamma_aug.detach().cpu()).numpy()
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-
-    if gamma_cvx is not None:
-        cvx_angle = torch.angle(gamma_cvx.detach().cpu()).numpy()
-        ax.plot(x_axis[: len(cvx_angle)], cvx_angle, "k-*", linewidth=1.0, markersize=6, label="CVX")
-
-    ax.plot(
-        x_axis[: len(aug_angle)],
-        aug_angle,
-        color="red",
-        marker="s",
-        markerfacecolor="none",
-        linewidth=1.0,
-        markersize=6,
-        label="Augment method",
-    )
-
-    if gamma_deep is not None:
-        deep_angle = torch.angle(gamma_deep.detach().cpu()).numpy()
-        ax.plot(
-            x_axis[: len(deep_angle)],
-            deep_angle,
-            color="blue",
-            marker=">",
-            markerfacecolor="none",
-            linewidth=1.0,
-            markersize=6,
-            label="Deep unfolding model",
-        )
-
-    ax.set_title("ANGLE(gamma)")
-    ax.set_xlabel("RIS element position y")
-    ax.set_ylabel("angle(gamma) [rad]")
-    ax.set_ylim([-4.0, 4.0])
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower center")
-    fig.tight_layout()
-
-    out_path = out_dir / "angle_gamma.png"
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
-    return out_path
-
+    return [abs_path, angle_path]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Corrected ALM solver for RIS surface net-power optimization.")
@@ -605,9 +625,9 @@ def parse_args() -> argparse.Namespace:
         help="Use direct upper impedance constraint instead of report quadratic form.",
     )
     parser.add_argument(
-        "--save-abs-gamma",
+        "--save-gamma-figures",
         action="store_true",
-        help="Save ABS(gamma) plot for augmented method (and optional comparison curves).",
+        help="Save both ABS(gamma) and ANGLE(gamma) comparison figures (Figure 4/5 style).",
     )
     parser.add_argument(
         "--cvx-gamma-file",
@@ -622,9 +642,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to deep-unfolding gamma vector (.pt/.pth/.npy/.npz/.txt/.csv).",
     )
     parser.add_argument(
-        "--save-angle-gamma",
-        action="store_true",
-        help="Save ANGLE(gamma) plot for augmented method (and optional comparison curves).",
+        "--gamma-x-axis",
+        type=str,
+        choices=["position", "cell"],
+        default="position",
+        help="X-axis for gamma plots: 'position' (paper-style y coordinate) or 'cell' (index 1..N).",
     )
     return parser.parse_args()
 
@@ -673,28 +695,18 @@ if __name__ == "__main__":
         for path in figure_paths:
             print(" -", path)
 
-    if args.save_abs_gamma:
+    if args.save_gamma_figures:
         gamma_cvx = _load_complex_vector(args.cvx_gamma_file) if args.cvx_gamma_file else None
         gamma_deep = _load_complex_vector(args.deep_gamma_file) if args.deep_gamma_file else None
-        abs_gamma_path = save_abs_gamma_figure(
+        gamma_fig_paths = save_gamma_comparison_figures(
             problem=problem,
             gamma_aug=result["gamma_star"],
             out_dir=args.figure_dir,
             gamma_cvx=gamma_cvx,
             gamma_deep=gamma_deep,
+            axis_mode=args.gamma_x_axis,
         )
-        print("saved abs(gamma) figure:")
-        print(" -", abs_gamma_path)
+        print("saved gamma comparison figures:")
+        for path in gamma_fig_paths:
+            print(" -", path)
 
-    if args.save_angle_gamma:
-        gamma_cvx = _load_complex_vector(args.cvx_gamma_file) if args.cvx_gamma_file else None
-        gamma_deep = _load_complex_vector(args.deep_gamma_file) if args.deep_gamma_file else None
-        angle_gamma_path = save_angle_gamma_figure(
-            problem=problem,
-            gamma_aug=result["gamma_star"],
-            out_dir=args.figure_dir,
-            gamma_cvx=gamma_cvx,
-            gamma_deep=gamma_deep,
-        )
-        print("saved angle(gamma) figure:")
-        print(" -", angle_gamma_path)
