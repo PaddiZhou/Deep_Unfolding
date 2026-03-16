@@ -527,6 +527,68 @@ def save_abs_gamma_figure(
     return out_path
 
 
+def save_angle_gamma_figure(
+    problem: RISSurfaceNetPowerProblem,
+    gamma_aug: torch.Tensor,
+    out_dir: Path,
+    gamma_cvx: Optional[torch.Tensor] = None,
+    gamma_deep: Optional[torch.Tensor] = None,
+) -> Path:
+    """Save ANGLE(gamma) figure matching paper-style comparison plot."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to save image outputs.") from exc
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    x_axis = problem.y_n.detach().cpu().numpy()
+    aug_angle = torch.angle(gamma_aug.detach().cpu()).numpy()
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    if gamma_cvx is not None:
+        cvx_angle = torch.angle(gamma_cvx.detach().cpu()).numpy()
+        ax.plot(x_axis[: len(cvx_angle)], cvx_angle, "k-*", linewidth=1.0, markersize=6, label="CVX")
+
+    ax.plot(
+        x_axis[: len(aug_angle)],
+        aug_angle,
+        color="red",
+        marker="s",
+        markerfacecolor="none",
+        linewidth=1.0,
+        markersize=6,
+        label="Augment method",
+    )
+
+    if gamma_deep is not None:
+        deep_angle = torch.angle(gamma_deep.detach().cpu()).numpy()
+        ax.plot(
+            x_axis[: len(deep_angle)],
+            deep_angle,
+            color="blue",
+            marker=">",
+            markerfacecolor="none",
+            linewidth=1.0,
+            markersize=6,
+            label="Deep unfolding model",
+        )
+
+    ax.set_title("ANGLE(gamma)")
+    ax.set_xlabel("RIS element position y")
+    ax.set_ylabel("angle(gamma) [rad]")
+    ax.set_ylim([-4.0, 4.0])
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower center")
+    fig.tight_layout()
+
+    out_path = out_dir / "angle_gamma.png"
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Corrected ALM solver for RIS surface net-power optimization.")
     parser.add_argument("--max-iters", type=int, default=2000, help="Maximum ALM outer iterations.")
@@ -558,6 +620,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional path to deep-unfolding gamma vector (.pt/.pth/.npy/.npz/.txt/.csv).",
+    )
+    parser.add_argument(
+        "--save-angle-gamma",
+        action="store_true",
+        help="Save ANGLE(gamma) plot for augmented method (and optional comparison curves).",
     )
     return parser.parse_args()
 
@@ -618,3 +685,16 @@ if __name__ == "__main__":
         )
         print("saved abs(gamma) figure:")
         print(" -", abs_gamma_path)
+
+    if args.save_angle_gamma:
+        gamma_cvx = _load_complex_vector(args.cvx_gamma_file) if args.cvx_gamma_file else None
+        gamma_deep = _load_complex_vector(args.deep_gamma_file) if args.deep_gamma_file else None
+        angle_gamma_path = save_angle_gamma_figure(
+            problem=problem,
+            gamma_aug=result["gamma_star"],
+            out_dir=args.figure_dir,
+            gamma_cvx=gamma_cvx,
+            gamma_deep=gamma_deep,
+        )
+        print("saved angle(gamma) figure:")
+        print(" -", angle_gamma_path)
