@@ -370,6 +370,166 @@ class CorrectedALMSolver:
 # 5) Initialization / visualization helpers
 # ============================================================
 
+
+def compute_merit(problem: RISSurfaceNetPowerProblem, x: torch.Tensor, use_report_upper: bool = True) -> torch.Tensor:
+    """统一的罚函数目标，用于 CVX-like 与 deep unfolding 训练。"""
+    g = problem.stacked_constraints(x, use_report_upper=use_report_upper)
+    penalty = torch.relu(g)
+    return problem.objective(x) + 1e2 * torch.sum(penalty**2)
+
+
+def solve_cvx_baseline(
+    problem: RISSurfaceNetPowerProblem,
+    cfg: ALMConfig,
+    use_report_upper: bool = True,
+) -> Dict:
+    """
+    CVX 基线：
+    - 若可用 cvxpy，则先解一个凸近似问题得到可行初值；
+    - 再用罚函数进行少量 torch 细化，保证和目标函数更一致。
+    """
+    x0 = init_gamma_as_real_vector(cfg, init_val=1e-3)
+    gamma_init = realvec_to_complex_gamma(x0, cfg.N)
+
+    try:
+        import cvxpy as cp  # type: ignore
+
+        uik = problem.build_uik(problem.theta_mask_rad).detach().cpu().numpy()
+        chi_ik = (
+            math.cos(math.radians(cfg.theta_r_deg)) ** 2
+            + torch.cos(problem.theta_mask_rad).cpu().numpy() ** 2
+            + 2.0 * math.cos(math.radians(cfg.theta_r_deg)) * torch.cos(problem.theta_mask_rad).cpu().numpy()
+        )
+        eps_tilde = cfg.eps_RM / (problem.ak() * (cfg.dy**2) * chi_ik + 1e-30)
+
+        g = cp.Variable(cfg.N, complex=True)
+        constraints = [cp.abs(g) <= 2.0]
+        for k in range(uik.shape[0]):
+            constraints.append(cp.abs(uik[k, :] @ g) <= float(max(eps_tilde[k], 1e-30)) ** 0.5)
+
+        # 凸近似目标：使 gamma 尽量小并保持相位平滑
+        obj = cp.Minimize(cp.norm(g, 2) + 1e-2 * cp.norm(g[1:] - g[:-1], 2))
+        prob = cp.Problem(obj, constraints)
+        prob.solve(solver=cp.SCS, verbose=False)
+
+        if g.value is not None:
+            gv = torch.from_numpy(g.value).to(torch.complex128)
+            gamma_init = gv
+    except Exception:
+        # cvxpy 不可用时，回退到默认初始化
+        pass
+
+    # 统一用 torch 罚函数细化，输出与其它方法同量纲
+    x = torch.cat([gamma_init.real.to(cfg.dtype), gamma_init.imag.to(cfg.dtype)], dim=0).to(cfg.device)
+    x = x.detach().clone().requires_grad_(True)
+    optim = torch.optim.Adam([x], lr=5e-3)
+    hist = []
+    for _ in range(500):
+        optim.zero_grad()
+        loss = compute_merit(problem, x, use_report_upper=use_report_upper)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([x], max_norm=1e3)
+        optim.step()
+        with torch.no_grad():
+            x.clamp_(-cfg.x_clip_value, cfg.x_clip_value)
+        hist.append(float(loss.detach().cpu()))
+
+    return {
+        "x_star": x.detach(),
+        "gamma_star": realvec_to_complex_gamma(x.detach(), cfg.N),
+        "history": {"loss": hist},
+        "iterations": len(hist),
+    }
+
+
+def solve_deep_unfolding(
+    problem: RISSurfaceNetPowerProblem,
+    cfg: ALMConfig,
+    use_report_upper: bool = True,
+    layers: int = 30,
+    epochs: int = 50,
+) -> Dict:
+    """
+    Deep unfolding: 把 ALM 的单步更新展开成多层，训练每层步长与动量系数。
+    """
+    J = problem.stacked_constraints(init_gamma_as_real_vector(cfg), use_report_upper=use_report_upper).numel()
+
+    mu = torch.nn.Parameter(torch.full((layers,), 1e-3, dtype=cfg.dtype, device=cfg.device))
+    beta = torch.nn.Parameter(torch.full((layers,), 0.5, dtype=cfg.dtype, device=cfg.device))
+    sigma = torch.nn.Parameter(torch.full((layers,), cfg.sigma0, dtype=cfg.dtype, device=cfg.device))
+
+    params = [mu, beta, sigma]
+    trainer = torch.optim.Adam(params, lr=1e-2)
+
+    x_init = init_gamma_as_real_vector(cfg, init_val=1e-3).to(cfg.device)
+    train_hist: List[float] = []
+
+    def unroll_once() -> torch.Tensor:
+        x = x_init.clone()
+        w = torch.zeros_like(x)
+        lam = torch.zeros(J, dtype=cfg.dtype, device=cfg.device)
+        s = torch.zeros(J, dtype=cfg.dtype, device=cfg.device)
+
+        for l in range(layers):
+            x_req = x.detach().clone().requires_grad_(True)
+            g = problem.stacked_constraints(x_req, use_report_upper=use_report_upper)
+            r = g + s
+            L = problem.objective(x_req) + torch.dot(lam, r) + 0.5 * torch.abs(sigma[l]) * torch.dot(r, r)
+            grad = torch.autograd.grad(L, x_req)[0]
+
+            step = torch.abs(mu[l])
+            mom = torch.tanh(beta[l])
+            w = mom * w - step * grad
+            x = torch.clamp(x + w, -cfg.x_clip_value, cfg.x_clip_value)
+
+            g_new = problem.stacked_constraints(x, use_report_upper=use_report_upper)
+            s = torch.clamp(-g_new - lam / (torch.abs(sigma[l]) + 1e-12), min=0.0)
+            lam = lam + torch.abs(sigma[l]) * (g_new + s)
+            lam = torch.clamp(lam, -cfg.lambda_clip_value, cfg.lambda_clip_value)
+
+        return x
+
+    for _ in range(epochs):
+        trainer.zero_grad()
+        x_out = unroll_once()
+        loss = compute_merit(problem, x_out, use_report_upper=use_report_upper)
+        loss.backward()
+        trainer.step()
+        train_hist.append(float(loss.detach().cpu()))
+
+    x_star = unroll_once().detach()
+    return {
+        "x_star": x_star,
+        "gamma_star": realvec_to_complex_gamma(x_star, cfg.N),
+        "history": {"loss": train_hist},
+        "iterations": epochs,
+    }
+
+
+def save_gamma_outputs(gamma: torch.Tensor, out_dir: Path, prefix: str) -> List[Path]:
+    """保存 gamma 本体以及 abs/angle 分布数据。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved: List[Path] = []
+
+    gamma_cpu = gamma.detach().cpu().to(torch.complex128)
+    torch.save(gamma_cpu, out_dir / f"{prefix}_gamma.pt")
+    saved.append(out_dir / f"{prefix}_gamma.pt")
+
+    import numpy as np
+
+    arr = gamma_cpu.numpy()
+    np.savetxt(out_dir / f"{prefix}_gamma_complex.csv", np.column_stack([arr.real, arr.imag]), delimiter=",")
+    np.savetxt(out_dir / f"{prefix}_gamma_abs.csv", np.abs(arr), delimiter=",")
+    np.savetxt(out_dir / f"{prefix}_gamma_angle.csv", np.angle(arr), delimiter=",")
+    saved.extend(
+        [
+            out_dir / f"{prefix}_gamma_complex.csv",
+            out_dir / f"{prefix}_gamma_abs.csv",
+            out_dir / f"{prefix}_gamma_angle.csv",
+        ]
+    )
+    return saved
+
 def init_gamma_as_real_vector(cfg: ALMConfig, init_val: float = 1e-3) -> torch.Tensor:
     re = init_val * torch.ones(cfg.N, dtype=cfg.dtype, device=cfg.device)
     im = torch.zeros(cfg.N, dtype=cfg.dtype, device=cfg.device)
@@ -764,6 +924,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip ALM solving and only draw/save plots using provided gamma files.",
     )
+    parser.add_argument(
+        "--run-three-methods",
+        action="store_true",
+        help="Run CVX baseline + ALM + Deep unfolding in one command and save all gamma outputs.",
+    )
+    parser.add_argument("--deep-layers", type=int, default=30, help="Unrolled layer count for deep unfolding.")
+    parser.add_argument("--deep-epochs", type=int, default=50, help="Training epochs for deep unfolding.")
     return parser.parse_args()
 
 
@@ -794,7 +961,57 @@ if __name__ == "__main__":
     gamma_cvx = _load_complex_vector(args.cvx_gamma_file) if args.cvx_gamma_file else None
     gamma_deep = _load_complex_vector(args.deep_gamma_file) if args.deep_gamma_file else None
 
-    if args.plot_only:
+    if args.run_three_methods:
+        print("Running three optimization methods: CVX baseline, ALM, Deep unfolding...")
+
+        # 1) CVX baseline
+        cvx_result = solve_cvx_baseline(problem, cfg, use_report_upper=use_report_upper)
+        gamma_cvx = cvx_result["gamma_star"]
+        for pth in save_gamma_outputs(gamma_cvx, args.figure_dir, "cvx"):
+            print("saved:", pth)
+
+        # 2) ALM
+        x0 = init_gamma_as_real_vector(cfg, init_val=1e-3)
+        alm_result = solver.solve(x0, use_report_upper=use_report_upper)
+        gamma_alm = alm_result["gamma_star"]
+        for pth in save_gamma_outputs(gamma_alm, args.figure_dir, "alm"):
+            print("saved:", pth)
+
+        # 3) Deep unfolding
+        deep_result = solve_deep_unfolding(
+            problem,
+            cfg,
+            use_report_upper=use_report_upper,
+            layers=args.deep_layers,
+            epochs=args.deep_epochs,
+        )
+        gamma_deep = deep_result["gamma_star"]
+        for pth in save_gamma_outputs(gamma_deep, args.figure_dir, "deep"):
+            print("saved:", pth)
+
+        # 自动保存对比图像（Figure4/5风格）
+        gamma_fig_paths = save_gamma_comparison_figures(
+            problem=problem,
+            gamma_aug=gamma_alm,
+            out_dir=args.figure_dir,
+            gamma_cvx=gamma_cvx,
+            gamma_deep=gamma_deep,
+            axis_mode=args.gamma_x_axis,
+        )
+        print("saved gamma comparison figures:")
+        for path in gamma_fig_paths:
+            print(" -", path)
+
+        if args.draw_gamma_turtle:
+            draw_gamma_with_turtle(
+                problem=problem,
+                gamma_aug=gamma_alm,
+                gamma_cvx=gamma_cvx,
+                gamma_deep=gamma_deep,
+                axis_mode=args.gamma_x_axis,
+            )
+
+    elif args.plot_only:
         # plot-only 模式下，不再跑 ALM；优先用 deep 曲线当主曲线，否则用 cvx。
         if gamma_deep is not None:
             gamma_aug = gamma_deep
